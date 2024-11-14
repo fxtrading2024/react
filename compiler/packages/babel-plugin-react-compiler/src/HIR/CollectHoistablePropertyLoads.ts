@@ -1,6 +1,13 @@
 import {CompilerError} from '../CompilerError';
 import {inRange} from '../ReactiveScopes/InferReactiveScopeVariables';
-import {Set_intersect, Set_union, getOrInsertDefault} from '../Utils/utils';
+import {printDependency} from '../ReactiveScopes/PrintReactiveFunction';
+import {
+  Set_equal,
+  Set_filter,
+  Set_intersect,
+  Set_union,
+  getOrInsertDefault,
+} from '../Utils/utils';
 import {
   BasicBlock,
   BlockId,
@@ -10,14 +17,17 @@ import {
   Identifier,
   IdentifierId,
   InstructionId,
+  InstructionValue,
   ReactiveScopeDependency,
   ScopeId,
 } from './HIR';
 
+const DEBUG_PRINT = false;
+
 /**
- * Helper function for `PropagateScopeDependencies`.
- * Uses control flow graph analysis to determine which `Identifier`s can
- * be assumed to be non-null objects, on a per-block basis.
+ * Helper function for `PropagateScopeDependencies`. Uses control flow graph
+ * analysis to determine which `Identifier`s can be assumed to be non-null
+ * objects, on a per-block basis.
  *
  * Here is an example:
  * ```js
@@ -42,15 +52,16 @@ import {
  * }
  * ```
  *
- * Note that we currently do NOT account for mutable / declaration range
- * when doing the CFG-based traversal, producing results that are technically
+ * Note that we currently do NOT account for mutable / declaration range when
+ * doing the CFG-based traversal, producing results that are technically
  * incorrect but filtered by PropagateScopeDeps (which only takes dependencies
  * on constructed value -- i.e. a scope's dependencies must have mutable ranges
  * ending earlier than the scope start).
  *
- * Take this example, this function will infer x.foo.bar as non-nullable for bb0,
- * via the intersection of bb1 & bb2 which in turn comes from bb3. This is technically
- * incorrect bb0 is before / during x's mutable range.
+ * Take this example, this function will infer x.foo.bar as non-nullable for
+ * bb0, via the intersection of bb1 & bb2 which in turn comes from bb3. This is
+ * technically incorrect bb0 is before / during x's mutable range.
+ * ```
  *  bb0:
  *    const x = ...;
  *    if cond then bb1 else bb2
@@ -62,27 +73,101 @@ import {
  *    goto bb3:
  *  bb3:
  *    x.foo.bar
+ * ```
+ *
+ * @param fn
+ * @param temporaries sidemap of identifier -> baseObject.a.b paths. Does not
+ * contain optional chains.
+ * @param hoistableFromOptionals sidemap of optionalBlock -> baseObject?.a
+ * optional paths for which it's safe to evaluate non-optional loads (see
+ * CollectOptionalChainDependencies).
+ * @returns
  */
 export function collectHoistablePropertyLoads(
   fn: HIRFunction,
   temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
-): ReadonlyMap<ScopeId, BlockInfo> {
+  hoistableFromOptionals: ReadonlyMap<BlockId, ReactiveScopeDependency>,
+): ReadonlyMap<BlockId, BlockInfo> {
   const registry = new PropertyPathRegistry();
+  /**
+   * Due to current limitations of mutable range inference, there are edge cases in
+   * which we infer known-immutable values (e.g. props or hook params) to have a
+   * mutable range and scope.
+   * (see `destructure-array-declaration-to-context-var` fixture)
+   * We track known immutable identifiers to reduce regressions (as PropagateScopeDeps
+   * is being rewritten to HIR).
+   */
+  const knownImmutableIdentifiers = new Set<IdentifierId>();
+  if (fn.fnType === 'Component' || fn.fnType === 'Hook') {
+    for (const p of fn.params) {
+      if (p.kind === 'Identifier') {
+        knownImmutableIdentifiers.add(p.identifier.id);
+      }
+    }
+  }
+  return collectHoistablePropertyLoadsImpl(fn, {
+    temporaries,
+    knownImmutableIdentifiers,
+    hoistableFromOptionals,
+    registry,
+    nestedFnImmutableContext: null,
+  });
+}
 
-  const nodes = collectNonNullsInBlocks(fn, temporaries, registry);
-  propagateNonNull(fn, nodes);
+type CollectHoistablePropertyLoadsContext = {
+  temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>;
+  knownImmutableIdentifiers: ReadonlySet<IdentifierId>;
+  hoistableFromOptionals: ReadonlyMap<BlockId, ReactiveScopeDependency>;
+  registry: PropertyPathRegistry;
+  /**
+   * (For nested / inner function declarations)
+   * Context variables (i.e. captured from an outer scope) that are immutable.
+   * Note that this technically could be merged into `knownImmutableIdentifiers`,
+   * but are currently kept separate for readability.
+   */
+  nestedFnImmutableContext: ReadonlySet<IdentifierId> | null;
+};
+function collectHoistablePropertyLoadsImpl(
+  fn: HIRFunction,
+  context: CollectHoistablePropertyLoadsContext,
+): ReadonlyMap<BlockId, BlockInfo> {
+  const functionExpressionLoads = collectFunctionExpressionFakeLoads(fn);
+  const actuallyEvaluatedTemporaries = new Map(
+    [...context.temporaries].filter(([id]) => !functionExpressionLoads.has(id)),
+  );
 
-  const nodesKeyedByScopeId = new Map<ScopeId, BlockInfo>();
-  for (const [_, block] of fn.body.blocks) {
-    if (block.terminal.kind === 'scope') {
-      nodesKeyedByScopeId.set(
-        block.terminal.scope.id,
-        nodes.get(block.terminal.block)!,
+  const nodes = collectNonNullsInBlocks(fn, {
+    ...context,
+    temporaries: actuallyEvaluatedTemporaries,
+  });
+  propagateNonNull(fn, nodes, context.registry);
+
+  if (DEBUG_PRINT) {
+    console.log('(printing hoistable nodes in blocks)');
+    for (const [blockId, node] of nodes) {
+      console.log(
+        `bb${blockId}: ${[...node.assumedNonNullObjects].map(n => printDependency(n.fullPath)).join(' ')}`,
       );
     }
   }
 
-  return nodesKeyedByScopeId;
+  return nodes;
+}
+
+export function keyByScopeId<T>(
+  fn: HIRFunction,
+  source: ReadonlyMap<BlockId, T>,
+): ReadonlyMap<ScopeId, T> {
+  const keyedByScopeId = new Map<ScopeId, T>();
+  for (const [_, block] of fn.body.blocks) {
+    if (block.terminal.kind === 'scope') {
+      keyedByScopeId.set(
+        block.terminal.scope.id,
+        source.get(block.terminal.block)!,
+      );
+    }
+  }
+  return keyedByScopeId;
 }
 
 export type BlockInfo = {
@@ -96,17 +181,21 @@ export type BlockInfo = {
  */
 type RootNode = {
   properties: Map<string, PropertyPathNode>;
+  optionalProperties: Map<string, PropertyPathNode>;
   parent: null;
   // Recorded to make later computations simpler
   fullPath: ReactiveScopeDependency;
+  hasOptional: boolean;
   root: IdentifierId;
 };
 
 type PropertyPathNode =
   | {
       properties: Map<string, PropertyPathNode>;
+      optionalProperties: Map<string, PropertyPathNode>;
       parent: PropertyPathNode;
       fullPath: ReactiveScopeDependency;
+      hasOptional: boolean;
     }
   | RootNode;
 
@@ -124,10 +213,12 @@ class PropertyPathRegistry {
       rootNode = {
         root: identifier.id,
         properties: new Map(),
+        optionalProperties: new Map(),
         fullPath: {
           identifier,
           path: [],
         },
+        hasOptional: false,
         parent: null,
       };
       this.roots.set(identifier.id, rootNode);
@@ -139,23 +230,20 @@ class PropertyPathRegistry {
     parent: PropertyPathNode,
     entry: DependencyPathEntry,
   ): PropertyPathNode {
-    if (entry.optional) {
-      CompilerError.throwTodo({
-        reason: 'handle optional nodes',
-        loc: GeneratedSource,
-      });
-    }
-    let child = parent.properties.get(entry.property);
+    const map = entry.optional ? parent.optionalProperties : parent.properties;
+    let child = map.get(entry.property);
     if (child == null) {
       child = {
         properties: new Map(),
+        optionalProperties: new Map(),
         parent: parent,
         fullPath: {
           identifier: parent.fullPath.identifier,
           path: parent.fullPath.path.concat(entry),
         },
+        hasOptional: parent.hasOptional || entry.optional,
       };
-      parent.properties.set(entry.property, child);
+      map.set(entry.property, child);
     }
     return child;
   }
@@ -184,56 +272,64 @@ class PropertyPathRegistry {
   }
 }
 
-function addNonNullPropertyPath(
-  source: Identifier,
-  sourceNode: PropertyPathNode,
-  instrId: InstructionId,
-  knownImmutableIdentifiers: Set<IdentifierId>,
-  result: Set<PropertyPathNode>,
-): void {
-  /**
-   * Since this runs *after* buildReactiveScopeTerminals, identifier mutable ranges
-   * are not valid with respect to current instruction id numbering.
-   * We use attached reactive scope ranges as a proxy for mutable range, but this
-   * is an overestimate as (1) scope ranges merge and align to form valid program
-   * blocks and (2) passes like MemoizeFbtAndMacroOperands may assign scopes to
-   * non-mutable identifiers.
-   *
-   * See comment at top of function for why we track known immutable identifiers.
-   */
-  const isMutableAtInstr =
-    source.mutableRange.end > source.mutableRange.start + 1 &&
-    source.scope != null &&
-    inRange({id: instrId}, source.scope.range);
-  if (
-    !isMutableAtInstr ||
-    knownImmutableIdentifiers.has(sourceNode.fullPath.identifier.id)
-  ) {
-    result.add(sourceNode);
+function getMaybeNonNullInInstruction(
+  instr: InstructionValue,
+  context: CollectHoistablePropertyLoadsContext,
+): PropertyPathNode | null {
+  let path = null;
+  if (instr.kind === 'PropertyLoad') {
+    path = context.temporaries.get(instr.object.identifier.id) ?? {
+      identifier: instr.object.identifier,
+      path: [],
+    };
+  } else if (instr.kind === 'Destructure') {
+    path = context.temporaries.get(instr.value.identifier.id) ?? null;
+  } else if (instr.kind === 'ComputedLoad') {
+    path = context.temporaries.get(instr.object.identifier.id) ?? null;
+  }
+  return path != null ? context.registry.getOrCreateProperty(path) : null;
+}
+
+function isImmutableAtInstr(
+  identifier: Identifier,
+  instr: InstructionId,
+  context: CollectHoistablePropertyLoadsContext,
+): boolean {
+  if (context.nestedFnImmutableContext != null) {
+    /**
+     * Comparing instructions ids across inner-outer function bodies is not valid, as they are numbered
+     */
+    return context.nestedFnImmutableContext.has(identifier.id);
+  } else {
+    /**
+     * Since this runs *after* buildReactiveScopeTerminals, identifier mutable ranges
+     * are not valid with respect to current instruction id numbering.
+     * We use attached reactive scope ranges as a proxy for mutable range, but this
+     * is an overestimate as (1) scope ranges merge and align to form valid program
+     * blocks and (2) passes like MemoizeFbtAndMacroOperands may assign scopes to
+     * non-mutable identifiers.
+     *
+     * See comment in exported function for why we track known immutable identifiers.
+     */
+    const mutableAtInstr =
+      identifier.mutableRange.end > identifier.mutableRange.start + 1 &&
+      identifier.scope != null &&
+      inRange(
+        {
+          id: instr,
+        },
+        identifier.scope.range,
+      );
+    return (
+      !mutableAtInstr || context.knownImmutableIdentifiers.has(identifier.id)
+    );
   }
 }
 
 function collectNonNullsInBlocks(
   fn: HIRFunction,
-  temporaries: ReadonlyMap<IdentifierId, ReactiveScopeDependency>,
-  registry: PropertyPathRegistry,
+  context: CollectHoistablePropertyLoadsContext,
 ): ReadonlyMap<BlockId, BlockInfo> {
-  /**
-   * Due to current limitations of mutable range inference, there are edge cases in
-   * which we infer known-immutable values (e.g. props or hook params) to have a
-   * mutable range and scope.
-   * (see `destructure-array-declaration-to-context-var` fixture)
-   * We track known immutable identifiers to reduce regressions (as PropagateScopeDeps
-   * is being rewritten to HIR).
-   */
-  const knownImmutableIdentifiers = new Set<IdentifierId>();
-  if (fn.fnType === 'Component' || fn.fnType === 'Hook') {
-    for (const p of fn.params) {
-      if (p.kind === 'Identifier') {
-        knownImmutableIdentifiers.add(p.identifier.id);
-      }
-    }
-  }
   /**
    * Known non-null objects such as functional component props can be safely
    * read from any block.
@@ -245,49 +341,56 @@ function collectNonNullsInBlocks(
     fn.params[0].kind === 'Identifier'
   ) {
     const identifier = fn.params[0].identifier;
-    knownNonNullIdentifiers.add(registry.getOrCreateIdentifier(identifier));
+    knownNonNullIdentifiers.add(
+      context.registry.getOrCreateIdentifier(identifier),
+    );
   }
   const nodes = new Map<BlockId, BlockInfo>();
   for (const [_, block] of fn.body.blocks) {
     const assumedNonNullObjects = new Set<PropertyPathNode>(
       knownNonNullIdentifiers,
     );
+
+    const maybeOptionalChain = context.hoistableFromOptionals.get(block.id);
+    if (maybeOptionalChain != null) {
+      assumedNonNullObjects.add(
+        context.registry.getOrCreateProperty(maybeOptionalChain),
+      );
+    }
     for (const instr of block.instructions) {
-      if (instr.value.kind === 'PropertyLoad') {
-        const source = temporaries.get(instr.value.object.identifier.id) ?? {
-          identifier: instr.value.object.identifier,
-          path: [],
-        };
-        addNonNullPropertyPath(
-          instr.value.object.identifier,
-          registry.getOrCreateProperty(source),
-          instr.id,
-          knownImmutableIdentifiers,
-          assumedNonNullObjects,
+      const maybeNonNull = getMaybeNonNullInInstruction(instr.value, context);
+      if (
+        maybeNonNull != null &&
+        isImmutableAtInstr(maybeNonNull.fullPath.identifier, instr.id, context)
+      ) {
+        assumedNonNullObjects.add(maybeNonNull);
+      }
+      if (
+        (instr.value.kind === 'FunctionExpression' ||
+          instr.value.kind === 'ObjectMethod') &&
+        !fn.env.config.enableTreatFunctionDepsAsConditional
+      ) {
+        const innerFn = instr.value.loweredFunc;
+        const innerHoistableMap = collectHoistablePropertyLoadsImpl(
+          innerFn.func,
+          {
+            ...context,
+            nestedFnImmutableContext:
+              context.nestedFnImmutableContext ??
+              new Set(
+                innerFn.func.context
+                  .filter(place =>
+                    isImmutableAtInstr(place.identifier, instr.id, context),
+                  )
+                  .map(place => place.identifier.id),
+              ),
+          },
         );
-      } else if (instr.value.kind === 'Destructure') {
-        const source = instr.value.value.identifier.id;
-        const sourceNode = temporaries.get(source);
-        if (sourceNode != null) {
-          addNonNullPropertyPath(
-            instr.value.value.identifier,
-            registry.getOrCreateProperty(sourceNode),
-            instr.id,
-            knownImmutableIdentifiers,
-            assumedNonNullObjects,
-          );
-        }
-      } else if (instr.value.kind === 'ComputedLoad') {
-        const source = instr.value.object.identifier.id;
-        const sourceNode = temporaries.get(source);
-        if (sourceNode != null) {
-          addNonNullPropertyPath(
-            instr.value.object.identifier,
-            registry.getOrCreateProperty(sourceNode),
-            instr.id,
-            knownImmutableIdentifiers,
-            assumedNonNullObjects,
-          );
+        const innerHoistables = assertNonNull(
+          innerHoistableMap.get(innerFn.func.body.entry),
+        );
+        for (const entry of innerHoistables.assumedNonNullObjects) {
+          assumedNonNullObjects.add(entry);
         }
       }
     }
@@ -303,6 +406,7 @@ function collectNonNullsInBlocks(
 function propagateNonNull(
   fn: HIRFunction,
   nodes: ReadonlyMap<BlockId, BlockInfo>,
+  registry: PropertyPathRegistry,
 ): void {
   const blockSuccessors = new Map<BlockId, Set<BlockId>>();
   const terminalPreds = new Set<BlockId>();
@@ -388,10 +492,17 @@ function propagateNonNull(
 
     const prevObjects = assertNonNull(nodes.get(nodeId)).assumedNonNullObjects;
     const mergedObjects = Set_union(prevObjects, neighborAccesses);
+    reduceMaybeOptionalChains(mergedObjects, registry);
 
     assertNonNull(nodes.get(nodeId)).assumedNonNullObjects = mergedObjects;
     traversalState.set(nodeId, 'done');
-    changed ||= prevObjects.size !== mergedObjects.size;
+    /**
+     * Note that it's not sufficient to compare set sizes since
+     * reduceMaybeOptionalChains may replace optional-chain loads with
+     * unconditional loads. This could in turn change `assumedNonNullObjects` of
+     * downstream blocks and backedges.
+     */
+    changed ||= !Set_equal(prevObjects, mergedObjects);
     return changed;
   }
   const traversalState = new Map<BlockId, 'done' | 'active'>();
@@ -439,4 +550,78 @@ export function assertNonNull<T extends NonNullable<U>, U>(
     loc: GeneratedSource,
   });
   return value;
+}
+
+/**
+ * Any two optional chains with different operations . vs ?. but the same set of
+ * property strings paths de-duplicates.
+ *
+ * Intuitively: given <base>?.b, we know <base> to be either hoistable or not.
+ * If unconditional reads from <base> are hoistable, we can replace all
+ * <base>?.PROPERTY_STRING subpaths with <base>.PROPERTY_STRING
+ */
+function reduceMaybeOptionalChains(
+  nodes: Set<PropertyPathNode>,
+  registry: PropertyPathRegistry,
+): void {
+  let optionalChainNodes = Set_filter(nodes, n => n.hasOptional);
+  if (optionalChainNodes.size === 0) {
+    return;
+  }
+  let changed: boolean;
+  do {
+    changed = false;
+
+    for (const original of optionalChainNodes) {
+      let {identifier, path: origPath} = original.fullPath;
+      let currNode: PropertyPathNode =
+        registry.getOrCreateIdentifier(identifier);
+      for (let i = 0; i < origPath.length; i++) {
+        const entry = origPath[i];
+        // If the base is known to be non-null, replace with a non-optional load
+        const nextEntry: DependencyPathEntry =
+          entry.optional && nodes.has(currNode)
+            ? {property: entry.property, optional: false}
+            : entry;
+        currNode = PropertyPathRegistry.getOrCreatePropertyEntry(
+          currNode,
+          nextEntry,
+        );
+      }
+      if (currNode !== original) {
+        changed = true;
+        optionalChainNodes.delete(original);
+        optionalChainNodes.add(currNode);
+        nodes.delete(original);
+        nodes.add(currNode);
+      }
+    }
+  } while (changed);
+}
+
+function collectFunctionExpressionFakeLoads(
+  fn: HIRFunction,
+): Set<IdentifierId> {
+  const sources = new Map<IdentifierId, IdentifierId>();
+  const functionExpressionReferences = new Set<IdentifierId>();
+
+  for (const [_, block] of fn.body.blocks) {
+    for (const {lvalue, value} of block.instructions) {
+      if (
+        value.kind === 'FunctionExpression' ||
+        value.kind === 'ObjectMethod'
+      ) {
+        for (const reference of value.loweredFunc.dependencies) {
+          let curr: IdentifierId | undefined = reference.identifier.id;
+          while (curr != null) {
+            functionExpressionReferences.add(curr);
+            curr = sources.get(curr);
+          }
+        }
+      } else if (value.kind === 'PropertyLoad') {
+        sources.set(lvalue.identifier.id, value.object.identifier.id);
+      }
+    }
+  }
+  return functionExpressionReferences;
 }

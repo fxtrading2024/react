@@ -434,6 +434,7 @@ const skipFilter = new Set([
   'todo.useContext-mutate-context-in-callback',
   'loop-unused-let',
   'reanimated-no-memo-arg',
+  'reanimated-shared-value-writes',
 
   'userspace-use-memo-cache',
   'transitive-freeze-function-expressions',
@@ -477,7 +478,15 @@ const skipFilter = new Set([
   // bugs
   'fbt/bug-fbt-plural-multiple-function-calls',
   'fbt/bug-fbt-plural-multiple-mixed-call-tag',
+  'bug-object-expression-computed-key-modified-during-after-construction-hoisted-sequence-expr',
   'bug-invalid-hoisting-functionexpr',
+  'bug-aliased-capture-aliased-mutate',
+  'bug-aliased-capture-mutate',
+  'bug-functiondecl-hoisting',
+  'bug-try-catch-maybe-null-dependency',
+  'bug-nonreactive-ref',
+  'reduce-reactive-deps/bug-infer-function-cond-access-not-hoisted',
+  'bug-invalid-phi-as-dependency',
   'reduce-reactive-deps/bug-merge-uncond-optional-chain-and-cond',
   'original-reactive-scopes-fork/bug-nonmutating-capture-in-unsplittable-memo-block',
   'original-reactive-scopes-fork/bug-hoisted-declaration-with-scope',

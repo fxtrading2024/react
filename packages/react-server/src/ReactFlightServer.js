@@ -18,7 +18,6 @@ import {
   enablePostpone,
   enableHalt,
   enableTaint,
-  enableRefAsProp,
   enableServerComponentLogs,
   enableOwnerStacks,
 } from 'shared/ReactFeatureFlags';
@@ -136,6 +135,9 @@ import getPrototypeOf from 'shared/getPrototypeOf';
 import binaryToComparableString from 'shared/binaryToComparableString';
 
 import {SuspenseException, getSuspendedThenable} from './ReactFlightThenable';
+
+// DEV-only set containing internal objects that should not be limited and turned into getters.
+const doNotLimit: WeakSet<Reference> = __DEV__ ? new WeakSet() : (null: any);
 
 function defaultFilterStackFrame(
   filename: string,
@@ -294,7 +296,7 @@ type ReactJSONValue =
 // Serializable values
 export type ReactClientValue =
   // Server Elements and Lazy Components are unwrapped on the Server
-  | React$Element<React$AbstractComponent<any, any>>
+  | React$Element<React$ComponentType<any>>
   | LazyComponent<ReactClientValue, any>
   // References are passed by their value
   | ClientReference<any>
@@ -693,22 +695,27 @@ function serializeThenable(
       pingTask(request, newTask);
     },
     reason => {
-      if (
-        enablePostpone &&
-        typeof reason === 'object' &&
-        reason !== null &&
-        (reason: any).$$typeof === REACT_POSTPONE_TYPE
-      ) {
-        const postponeInstance: Postpone = (reason: any);
-        logPostpone(request, postponeInstance.message, newTask);
-        emitPostponeChunk(request, newTask.id, postponeInstance);
-      } else {
-        const digest = logRecoverableError(request, reason, newTask);
-        emitErrorChunk(request, newTask.id, digest, reason);
+      if (newTask.status === PENDING) {
+        // We expect that the only status it might be otherwise is ABORTED.
+        // When we abort we emit chunks in each pending task slot and don't need
+        // to do so again here.
+        if (
+          enablePostpone &&
+          typeof reason === 'object' &&
+          reason !== null &&
+          (reason: any).$$typeof === REACT_POSTPONE_TYPE
+        ) {
+          const postponeInstance: Postpone = (reason: any);
+          logPostpone(request, postponeInstance.message, newTask);
+          emitPostponeChunk(request, newTask.id, postponeInstance);
+        } else {
+          const digest = logRecoverableError(request, reason, newTask);
+          emitErrorChunk(request, newTask.id, digest, reason);
+        }
+        newTask.status = ERRORED;
+        request.abortableTasks.delete(newTask);
+        enqueueFlush(request);
       }
-      newTask.status = ERRORED;
-      request.abortableTasks.delete(newTask);
-      enqueueFlush(request);
     },
   );
 
@@ -1962,6 +1969,12 @@ function serializeUndefined(): string {
   return '$undefined';
 }
 
+function serializeDate(date: Date): string {
+  // JSON.stringify automatically calls Date.prototype.toJSON which calls toISOString.
+  // We need only tack on a $D prefix.
+  return '$D' + date.toJSON();
+}
+
 function serializeDateFromDateJSON(dateJSON: string): string {
   // JSON.stringify automatically calls Date.prototype.toJSON which calls toISOString.
   // We need only tack on a $D prefix.
@@ -2147,6 +2160,22 @@ function serializeConsoleMap(
 ): string {
   // Like serializeMap but for renderConsoleValue.
   const entries = Array.from(map);
+  // The Map itself doesn't take up any space but the outlined object does.
+  counter.objectLimit++;
+  for (let i = 0; i < entries.length; i++) {
+    // Outline every object entry in case we run out of space to serialize them.
+    // Because we can't mark these values as limited.
+    const entry = entries[i];
+    doNotLimit.add(entry);
+    const key = entry[0];
+    const value = entry[1];
+    if (typeof key === 'object' && key !== null) {
+      doNotLimit.add(key);
+    }
+    if (typeof value === 'object' && value !== null) {
+      doNotLimit.add(value);
+    }
+  }
   const id = outlineConsoleValue(request, counter, entries);
   return '$Q' + id.toString(16);
 }
@@ -2158,6 +2187,16 @@ function serializeConsoleSet(
 ): string {
   // Like serializeMap but for renderConsoleValue.
   const entries = Array.from(set);
+  // The Set itself doesn't take up any space but the outlined object does.
+  counter.objectLimit++;
+  for (let i = 0; i < entries.length; i++) {
+    // Outline every object entry in case we run out of space to serialize them.
+    // Because we can't mark these values as limited.
+    const entry = entries[i];
+    if (typeof entry === 'object' && entry !== null) {
+      doNotLimit.add(entry);
+    }
+  }
   const id = outlineConsoleValue(request, counter, entries);
   return '$W' + id.toString(16);
 }
@@ -2472,16 +2511,10 @@ function renderModelDestructive(
         }
 
         const props = element.props;
-        let ref;
-        if (enableRefAsProp) {
-          // TODO: This is a temporary, intermediate step. Once the feature
-          // flag is removed, we should get the ref off the props object right
-          // before using it.
-          const refProp = props.ref;
-          ref = refProp !== undefined ? refProp : null;
-        } else {
-          ref = element.ref;
-        }
+        // TODO: We should get the ref off the props object right before using
+        // it.
+        const refProp = props.ref;
+        const ref = refProp !== undefined ? refProp : null;
 
         // Attempt to render the Server Component.
 
@@ -2777,6 +2810,14 @@ function renderModelDestructive(
           getAsyncIterator,
         );
       }
+    }
+
+    // We put the Date check low b/c most of the time Date's will already have been serialized
+    // before we process it in this function but when rendering a Date() as a top level it can
+    // end up being a Date instance here. This is rare so we deprioritize it by putting it deep
+    // in this function
+    if (value instanceof Date) {
+      return serializeDate(value);
     }
 
     // Verify that this is a simple plain object.
@@ -3362,18 +3403,13 @@ function renderConsoleValue(
   parentPropertyName: string,
   value: ReactClientValue,
 ): ReactJSONValue {
-  // Make sure that `parent[parentPropertyName]` wasn't JSONified before `value` was passed to us
-  // $FlowFixMe[incompatible-use]
-  const originalValue = parent[parentPropertyName];
-  if (
-    typeof originalValue === 'object' &&
-    originalValue !== value &&
-    !(originalValue instanceof Date)
-  ) {
-  }
-
   if (value === null) {
     return null;
+  }
+
+  // Special Symbol, that's very common.
+  if (value === REACT_ELEMENT_TYPE) {
+    return '$';
   }
 
   if (typeof value === 'object') {
@@ -3407,7 +3443,7 @@ function renderConsoleValue(
       return existingReference;
     }
 
-    if (counter.objectLimit <= 0) {
+    if (counter.objectLimit <= 0 && !doNotLimit.has(value)) {
       // We've reached our max number of objects to serialize across the wire so we serialize this
       // as a marker so that the client can error when this is accessed by the console.
       return serializeLimitedObject();
@@ -3422,17 +3458,28 @@ function renderConsoleValue(
         if (element._owner != null) {
           outlineComponentInfo(request, element._owner);
         }
+        if (typeof element.type === 'object' && element.type !== null) {
+          // If the type is an object it can get cut off which shouldn't happen here.
+          doNotLimit.add(element.type);
+        }
+        if (typeof element.key === 'object' && element.key !== null) {
+          // This should never happen but just in case.
+          doNotLimit.add(element.key);
+        }
+        doNotLimit.add(element.props);
+        if (element._owner !== null) {
+          doNotLimit.add(element._owner);
+        }
+
         if (enableOwnerStacks) {
           let debugStack: null | ReactStackTrace = null;
           if (element._debugStack != null) {
             // Outline the debug stack so that it doesn't get cut off.
             debugStack = filterStackTrace(request, element._debugStack, 1);
-            const stackId = outlineConsoleValue(
-              request,
-              {objectLimit: debugStack.length + 2},
-              debugStack,
-            );
-            request.writtenObjects.set(debugStack, serializeByValueID(stackId));
+            doNotLimit.add(debugStack);
+            for (let i = 0; i < debugStack.length; i++) {
+              doNotLimit.add(debugStack[i]);
+            }
           }
           return [
             REACT_ELEMENT_TYPE,
@@ -3578,6 +3625,9 @@ function renderConsoleValue(
   if (typeof value === 'string') {
     if (value[value.length - 1] === 'Z') {
       // Possibly a Date, whose toJSON automatically calls toISOString
+      // Make sure that `parent[parentPropertyName]` wasn't JSONified before `value` was passed to us
+      // $FlowFixMe[incompatible-use]
+      const originalValue = parent[parentPropertyName];
       if (originalValue instanceof Date) {
         return serializeDateFromDateJSON(value);
       }
@@ -3646,6 +3696,10 @@ function renderConsoleValue(
     return serializeBigInt(value);
   }
 
+  if (value instanceof Date) {
+    return serializeDate(value);
+  }
+
   return 'unknown type ' + typeof value;
 }
 
@@ -3660,6 +3714,11 @@ function outlineConsoleValue(
     throw new Error(
       'outlineConsoleValue should never be called in production mode. This is a bug in React.',
     );
+  }
+
+  if (typeof model === 'object' && model !== null) {
+    // We can't limit outlined values.
+    doNotLimit.add(model);
   }
 
   function replacer(
@@ -3684,8 +3743,16 @@ function outlineConsoleValue(
     }
   }
 
-  // $FlowFixMe[incompatible-type] stringify can return null
-  const json: string = stringify(model, replacer);
+  let json: string;
+  try {
+    // $FlowFixMe[incompatible-cast] stringify can return null
+    json = (stringify(model, replacer): string);
+  } catch (x) {
+    // $FlowFixMe[incompatible-cast] stringify can return null
+    json = (stringify(
+      'Unknown Value: React could not send it from the server.\n' + x.message,
+    ): string);
+  }
 
   request.pendingChunks++;
   const id = request.nextChunkId++;
@@ -3744,8 +3811,23 @@ function emitConsoleChunk(
   const payload = [methodName, stackTrace, owner, env];
   // $FlowFixMe[method-unbinding]
   payload.push.apply(payload, args);
-  // $FlowFixMe[incompatible-type] stringify can return null
-  const json: string = stringify(payload, replacer);
+  let json: string;
+  try {
+    // $FlowFixMe[incompatible-type] stringify can return null
+    json = stringify(payload, replacer);
+  } catch (x) {
+    json = stringify(
+      [
+        methodName,
+        stackTrace,
+        owner,
+        env,
+        'Unknown Value: React could not send it from the server.',
+        x,
+      ],
+      replacer,
+    );
+  }
   const row = serializeRowHeader('W', id) + json + '\n';
   const processedChunk = stringToChunk(row);
   request.completedRegularChunks.push(processedChunk);
